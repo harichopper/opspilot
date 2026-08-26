@@ -247,12 +247,19 @@ class OpsPilotOrchestrator:
         repo = request.github_repo or self._settings.github_repo
         run_in_demo = bool(request.demo_mode)
 
-        if run_in_demo:
+        goal = request.goal
+        if not goal or goal.strip().lower() in ("string", "undefined", "null"):
+            goal = "Clean up my highest-priority engineering work."
+
+        is_placeholder_owner = not owner or owner.lower() in ("string", "undefined", "null")
+        is_placeholder_repo = not repo or repo.lower() in ("string", "string/string", "undefined", "null")
+
+        if run_in_demo or is_placeholder_owner or is_placeholder_repo:
             owner = DEMO_OWNER
             repo = DEMO_REPO
 
         effective_request = AgentExecutionRequest(
-            goal=request.goal,
+            goal=goal,
             github_owner=owner,
             github_repo=repo,
             demo_mode=run_in_demo,

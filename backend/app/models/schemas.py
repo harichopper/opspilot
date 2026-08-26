@@ -36,9 +36,9 @@ class HealthResponse(BaseModel):
 
 
 class AgentExecutionRequest(BaseModel):
-    goal: str = Field(min_length=3, max_length=2000)
-    github_owner: str | None = Field(default=None, min_length=1, max_length=100)
-    github_repo: str | None = Field(default=None, min_length=1, max_length=100)
+    goal: str = Field(default="Clean up my highest-priority engineering work.", min_length=3, max_length=2000, json_schema_extra={"example": "Clean up my highest-priority engineering work."})
+    github_owner: str | None = Field(default="harichopper", min_length=1, max_length=100, json_schema_extra={"example": "harichopper"})
+    github_repo: str | None = Field(default="opspilot", min_length=1, max_length=100, json_schema_extra={"example": "opspilot"})
     demo_mode: bool = False
     auto_approve: bool = False
 
@@ -96,10 +96,10 @@ class ProjectResponse(BaseModel):
 
 
 class JobCreateRequest(BaseModel):
-    goal: str = Field(min_length=3, max_length=2000)
-    project_id: str | None = Field(default=None, min_length=1, max_length=200)
-    github_owner: str | None = Field(default=None, min_length=1, max_length=100)
-    github_repo: str | None = Field(default=None, min_length=1, max_length=100)
+    goal: str = Field(default="Clean up my highest-priority engineering work.", min_length=3, max_length=2000, json_schema_extra={"example": "Clean up my highest-priority engineering work."})
+    project_id: str | None = Field(default=None, min_length=1, max_length=200, json_schema_extra={"example": "github:harichopper/opspilot"})
+    github_owner: str | None = Field(default="harichopper", min_length=1, max_length=100, json_schema_extra={"example": "harichopper"})
+    github_repo: str | None = Field(default="opspilot", min_length=1, max_length=100, json_schema_extra={"example": "opspilot"})
     demo_mode: bool = False
     auto_approve: bool = False
 

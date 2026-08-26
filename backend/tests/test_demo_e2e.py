@@ -57,3 +57,25 @@ def test_demo_mode_e2e_completes_with_pr_and_tests_passed() -> None:
         assert "OPS PILOT REPORT" in job.report
 
     _run(run())
+
+
+def test_demo_mode_defaults_and_placeholder_sanitization_target_harichopper_opspilot() -> None:
+    settings = Settings()
+    orchestrator = OpsPilotOrchestrator(settings, demo_mode=True)
+
+    async def run() -> None:
+        job = await orchestrator.start_job(
+            goal="string",
+            project_id=None,
+            github_owner="string",
+            github_repo="string/string",
+            auto_approve=True,
+            background=False,
+            demo_mode=True,
+        )
+        assert job.github_owner == "harichopper"
+        assert job.github_repo == "opspilot"
+        assert job.project_id == "github:harichopper/opspilot"
+
+    _run(run())
+

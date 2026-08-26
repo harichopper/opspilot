@@ -25,8 +25,8 @@ class Settings(BaseSettings):
     google_cloud_location: str = Field(default="us-central1", validation_alias="GOOGLE_CLOUD_LOCATION")
 
     github_token: str | None = Field(default=None, validation_alias="GITHUB_TOKEN")
-    github_owner: str | None = Field(default=None, validation_alias="GITHUB_OWNER")
-    github_repo: str | None = Field(default=None, validation_alias="GITHUB_REPO")
+    github_owner: str | None = Field(default="harichopper", validation_alias="GITHUB_OWNER")
+    github_repo: str | None = Field(default="opspilot", validation_alias="GITHUB_REPO")
 
 
 @lru_cache

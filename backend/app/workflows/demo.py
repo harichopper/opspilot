@@ -15,8 +15,8 @@ from backend.app.config.settings import Settings
 from backend.app.models import ToolResult, ToolStatus, RiskLevel
 
 
-DEMO_OWNER = "opspilot"
-DEMO_REPO = "demo-repo"
+DEMO_OWNER = "harichopper"
+DEMO_REPO = "opspilot"
 DEMO_DEFAULT_BRANCH = "main"
 DEMO_HEAD_SHA = "a" * 40
 DEMO_FIX_BRANCH = "opspilot/fix-auth-test"

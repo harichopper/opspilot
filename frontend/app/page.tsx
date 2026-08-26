@@ -111,8 +111,8 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>("dashboard");
 
   const [goal, setGoal] = useState(DEFAULT_GOAL);
-  const [githubOwner, setGithubOwner] = useState("");
-  const [githubRepo, setGithubRepo] = useState("");
+  const [githubOwner, setGithubOwner] = useState("harichopper");
+  const [githubRepo, setGithubRepo] = useState("opspilot");
   const [demoMode, setDemoMode] = useState(true);
   const [autoApprove, setAutoApprove] = useState(true);
 
@@ -138,8 +138,8 @@ export default function Home() {
 
   const projectId = useMemo(() => {
     if (activeJob) return activeJob.project_id;
-    const o = githubOwner || "opspilot";
-    const r = githubRepo || "demo-repo";
+    const o = githubOwner || "harichopper";
+    const r = githubRepo || "opspilot";
     return `github:${o.toLowerCase()}/${r.toLowerCase()}`;
   }, [activeJob, githubOwner, githubRepo]);
 
