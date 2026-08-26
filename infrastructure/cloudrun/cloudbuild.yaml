@@ -1,0 +1,61 @@
+steps:
+  - id: build-backend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - infrastructure/cloudrun/backend.Dockerfile
+      - -t
+      - ${_BACKEND_IMAGE}
+      - .
+  - id: push-backend
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "${_BACKEND_IMAGE}"]
+    waitFor: ["build-backend"]
+  - id: build-frontend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - infrastructure/cloudrun/frontend.Dockerfile
+      - -t
+      - ${_FRONTEND_IMAGE}
+      - .
+    waitFor: ["-"]
+  - id: push-frontend
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "${_FRONTEND_IMAGE}"]
+    waitFor: ["build-frontend"]
+  - id: deploy-backend
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - opspilot-backend
+      - --image=${_BACKEND_IMAGE}
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --set-env-vars=OPSPILOT_ENV=production
+      - --set-secrets=GEMINI_API_KEY=projects/${PROJECT_ID}/secrets/GEMINI_API_KEY:latest,GITHUB_TOKEN=projects/${PROJECT_ID}/secrets/GITHUB_TOKEN:latest
+    waitFor: ["push-backend"]
+  - id: deploy-frontend
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - opspilot-frontend
+      - --image=${_FRONTEND_IMAGE}
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+    waitFor: ["push-frontend"]
+substitutions:
+  _REGION: us-central1
+  _BACKEND_IMAGE: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/opspilot/backend
+  _FRONTEND_IMAGE: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/opspilot/frontend
+images:
+  - ${_BACKEND_IMAGE}
+  - ${_FRONTEND_IMAGE}
