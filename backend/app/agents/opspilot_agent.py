@@ -750,6 +750,92 @@ class OpsPilotOrchestrator:
         return commits.data["commits"][0].get("sha", "")
 
     @staticmethod
+    def _is_generic_triage_goal(goal: str) -> bool:
+        g = (goal or "").strip().lower()
+        generic_phrases = {
+            "clean up my highest-priority engineering work.",
+            "clean up my highest-priority engineering work",
+            "clean up highest-priority engineering work",
+            "triage repository",
+            "triage open issues",
+            "scan repository",
+            "find issues",
+            "",
+            "string",
+        }
+        return g in generic_phrases
+
+    @staticmethod
+    def _is_read_only_goal(goal: str) -> bool:
+        g = (goal or "").lower()
+
+        explicit_read_only_phrases = [
+            "do not modify",
+            "dont modify",
+            "don't modify",
+            "do not create a branch",
+            "do not create branch",
+            "do not create commits",
+            "do not create commit",
+            "do not create a pull request",
+            "do not create a pr",
+            "no modification",
+            "no modifications",
+            "read-only",
+            "read only",
+            "inspect only",
+            "audit only",
+            "report only",
+            "dry-run",
+            "dry run",
+        ]
+        if any(phrase in g for phrase in explicit_read_only_phrases):
+            return True
+
+        modification_phrases = [
+            "fix",
+            "implement",
+            "modify",
+            "change",
+            "update",
+            "create a branch",
+            "create branch",
+            "add tests",
+            "add or update tests",
+            "update tests",
+            "commit",
+            "pull request",
+            "open a pr",
+            "create a pr",
+        ]
+
+        if any(phrase in g for phrase in modification_phrases):
+            return False
+
+        read_only_phrases = [
+            "read-only",
+            "read only",
+            "do not modify",
+            "dont modify",
+            "don't modify",
+            "no modification",
+            "no modifications",
+            "inspect only",
+            "audit only",
+            "report only",
+            "dry-run",
+            "dry run",
+            "do not create a branch",
+            "do not create branch",
+            "do not create commits",
+            "do not create commit",
+            "do not create a pull request",
+            "do not create a pr",
+        ]
+
+        return any(phrase in g for phrase in read_only_phrases)
+
+    @staticmethod
     def _fix_branch_name(issue: dict[str, Any]) -> str:
         number = issue.get("number", 0)
         title = (issue.get("title") or "fix").lower()
