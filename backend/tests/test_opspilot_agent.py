@@ -44,3 +44,23 @@ def test_orchestrator_policy_engine_blocks_blocked_tools() -> None:
     )
     assert decision.blocked is True
     assert decision.allowed is False
+
+
+def test_modification_goal_is_not_read_only() -> None:
+    goal = "Fix the auth validation bug and update the tests."
+    assert OpsPilotOrchestrator._is_read_only_goal(goal) is False
+
+
+def test_inspect_analyze_only_goal_remains_read_only() -> None:
+    goal = "Inspect and analyze the repository only; do not modify files."
+    assert OpsPilotOrchestrator._is_read_only_goal(goal) is True
+
+
+def test_identify_and_fix_goal_is_not_read_only() -> None:
+    goal = "Identify the root cause and fix the failing login flow."
+    assert OpsPilotOrchestrator._is_read_only_goal(goal) is False
+
+
+def test_explicit_no_branch_commit_pr_goal_remains_read_only() -> None:
+    goal = "Inspect the repository and report findings; do not create a branch, do not commit, and do not open a PR."
+    assert OpsPilotOrchestrator._is_read_only_goal(goal) is True
