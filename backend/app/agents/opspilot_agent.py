@@ -27,6 +27,7 @@ from backend.app.models import (
     ToolStatus,
 )
 from backend.app.policies import APPROVAL_EXPIRY_SECONDS, PolicyDecision, PolicyEngine
+from backend.app.services.github_app_service import GitHubAppService
 from backend.app.tools import GitHubToolkit, LocalTestRunner
 from backend.app.workflows.approval import ApprovalRequest, ApprovalService, ApprovalStatus
 from backend.app.workflows.demo import (
@@ -109,6 +110,8 @@ class _AgentContext:
     demo_mode: bool
     auto_approve: bool
     goal: str
+    user_token: str | None = None
+    installation_id: str | None = None
     tool_calls_count: int = 0
     failure_count: int = 0
     selected_issue: dict[str, Any] | None = None
@@ -118,6 +121,18 @@ class _AgentContext:
     tests_passed_after_fix: bool = False
     pr_created: bool = False
     demo_workspace: DemoWorkspace | None = None
+    # The branch name actually created for this job's fix.
+    # Set by _apply_fix after successful create_branch so that _open_pr and
+    # modify_file always target the same branch even when a unique suffix was
+    # appended to avoid a collision with a pre-existing branch.
+    active_branch_name: str = ""
+    # Paths confirmed to exist in the repository via a successful get_file call.
+    # Only paths in this set may be passed to modify_file in non-demo mode.
+    verified_file_paths: "set[str]" = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.verified_file_paths is None:
+            object.__setattr__(self, "verified_file_paths", set())
 
 
 class OpsPilotOrchestrator:
@@ -231,6 +246,8 @@ class OpsPilotOrchestrator:
         demo_mode: bool | None = None,
         auto_approve: bool | None = None,
         project_id: str | None = None,
+        installation_id: str | None = None,
+        user_token: str | None = None,
         **_ignored: Any,
     ) -> JobRecord:
         if request is None:
@@ -242,6 +259,8 @@ class OpsPilotOrchestrator:
                 github_repo=github_repo,
                 demo_mode=bool(demo_mode),
                 auto_approve=bool(auto_approve),
+                installation_id=installation_id,
+                user_token=user_token,
             )
         owner = request.github_owner or self._settings.github_owner
         repo = request.github_repo or self._settings.github_repo
@@ -264,6 +283,8 @@ class OpsPilotOrchestrator:
             github_repo=repo,
             demo_mode=run_in_demo,
             auto_approve=bool(request.auto_approve),
+            installation_id=request.installation_id,
+            user_token=request.user_token,
         )
 
         job = self._jobs.create(effective_request)
@@ -278,6 +299,8 @@ class OpsPilotOrchestrator:
             demo_mode=demo_mode,
             auto_approve=bool(request.auto_approve),
             goal=request.goal,
+            user_token=request.user_token,
+            installation_id=request.installation_id,
         )
         if demo_mode:
             ctx.demo_workspace = make_demo_workspace()
@@ -368,7 +391,7 @@ class OpsPilotOrchestrator:
             self._jobs.transition(job, JobStatus.needs_attention, "No repository configured")
             return
 
-        github = self._resolve_github_toolkit(ctx)
+        github = await self._resolve_github_toolkit(ctx)
 
         self._jobs.set_current_step(job, "inspect_repository")
         repo_result = await self._safe_tool_call(ctx, "get_repository", github.get_repository, ctx.owner, ctx.repo)
@@ -396,8 +419,9 @@ class OpsPilotOrchestrator:
         issues_result = await self._safe_tool_call(ctx, "list_issues", github.list_issues, ctx.owner, ctx.repo)
         prs_result = await self._safe_tool_call(ctx, "list_pull_requests", github.list_pull_requests, ctx.owner, ctx.repo)
         commits_result = await self._safe_tool_call(ctx, "get_recent_commits", github.get_recent_commits, ctx.owner, ctx.repo)
+        recent_commits = (commits_result.data.get("commits") or []) if commits_result.status == ToolStatus.success else []
         head_sha_for_ci = DEMO_HEAD_SHA if ctx.demo_mode else (
-            commits_result.data.get("commits", [{}])[0].get("sha", "") if commits_result.status == ToolStatus.success else ""
+            recent_commits[0].get("sha", "") if recent_commits else ""
         )
         ci_result: ToolResult | None = None
         if head_sha_for_ci:
@@ -425,27 +449,43 @@ class OpsPilotOrchestrator:
         self._jobs.set_current_step(job, "prioritize_tasks")
         selected = self._select_highest_priority_task(discovered_issues, discovered_prs, ci_result)
         if selected is None:
-            self._jobs.append_step(job, AgentStep(
-                name="prioritize_tasks",
-                status="completed",
-                detail="No actionable tasks found. Repository is clean.",
-            ))
-            self._jobs.set_plan(job, [
-                "No prioritized action required. Repository appears clean.",
-            ])
-            self._write_memory_for_clean_scan(project_id, repo_result.data)
-            self._jobs.set_report(job, self._build_final_report(ctx, completed_summary="Repository clean; nothing to do.", approval_summary="", failed_summary=""))
-            self._jobs.transition(job, JobStatus.completed, "Repository clean")
-            return
+            if not self._is_generic_triage_goal(ctx.goal):
+                title = self._extract_task_title(ctx.goal)
+                selected = {
+                    "number": 0,
+                    "title": title,
+                    "body": ctx.goal,
+                    "labels": ["user-goal"],
+                    "priority_score": 50,
+                    "is_synthetic": True,
+                }
+            else:
+                self._jobs.append_step(job, AgentStep(
+                    name="prioritize_tasks",
+                    status="completed",
+                    detail="No actionable tasks found. Repository is clean.",
+                ))
+                self._jobs.set_plan(job, [
+                    "No prioritized action required. Repository appears clean.",
+                ])
+                self._write_memory_for_clean_scan(project_id, repo_result.data)
+                self._jobs.set_report(job, self._build_final_report(ctx, completed_summary="Repository clean; nothing to do.", approval_summary="", failed_summary=""))
+                self._jobs.transition(job, JobStatus.completed, "Repository clean")
+                return
 
         ctx.selected_issue = selected
         ctx.selected_task_title = selected.get("title", "Selected task")
         issue_number = selected.get("number", 0)
         issue_title = selected.get("title", "")
+        detail_msg = (
+            f"Selected task #{issue_number}: {issue_title} (priority score {selected.get('priority_score', 0)})"
+            if issue_number > 0
+            else f"Executing user goal task: {issue_title}"
+        )
         self._jobs.append_step(job, AgentStep(
             name="prioritize_tasks",
             status="completed",
-            detail=f"Selected task #{issue_number}: {issue_title} (priority score {selected.get('priority_score', 0)})",
+            detail=detail_msg,
         ))
 
         plan = self._build_plan(selected, repo_result.data)
@@ -481,9 +521,15 @@ class OpsPilotOrchestrator:
         self._store_memory_after_fix(ctx, selected, repo_result.data)
 
         self._jobs.set_current_step(job, "report")
+        if self._is_read_only_goal(ctx.goal):
+            comp_summary = f"Completed read-only investigation for task: {ctx.selected_task_title}. Inspected repository, verified tests."
+        elif selected.get("number", 0) > 0:
+            comp_summary = f"Fixed task #{selected.get('number')}: {selected.get('title', '')}. Created PR, tests passed."
+        else:
+            comp_summary = f"Completed user task: {selected.get('title', '')}. Created PR, tests passed."
         report = self._build_final_report(
             ctx,
-            completed_summary=f"Fixed task #{selected.get('number')}: {selected.get('title', '')}. Created PR, tests passed.",
+            completed_summary=comp_summary,
             approval_summary=self._build_approval_summary(ctx),
             failed_summary="",
         )
@@ -499,49 +545,85 @@ class OpsPilotOrchestrator:
     async def _investigate_task(self, ctx: _AgentContext, github: GitHubToolkit, issue: dict[str, Any]) -> None:
         job = ctx.job
         number = issue.get("number", 0)
-        issue_detail = await self._safe_tool_call(ctx, "get_issue", github.get_issue, ctx.owner, ctx.repo, number)
-        if issue_detail.status == ToolStatus.success:
+        if number > 0:
+            issue_detail = await self._safe_tool_call(ctx, "get_issue", github.get_issue, ctx.owner, ctx.repo, number)
+            if issue_detail.status == ToolStatus.success:
+                self._jobs.append_step(job, AgentStep(
+                    name="issue_inspection",
+                    status="completed",
+                    detail=f"Read issue #{number}: {issue.get('title', '')}",
+                ))
+        else:
             self._jobs.append_step(job, AgentStep(
-                name="issue_inspection",
+                name="task_inspection",
                 status="completed",
-                detail=f"Read issue #{number}: {issue.get('title', '')}",
+                detail=f"Inspecting user task: {issue.get('title', '')}",
             ))
         search_queries: list[str] = []
-        title_low = (issue.get("title") or "").lower()
-        if "auth" in title_low or "token" in title_low or "jwt" in title_low:
-            search_queries.append("auth OR token OR jwt")
+        title_low = (issue.get("title") or "").lower() + " " + (issue.get("body") or "").lower()
+        if "auth" in title_low or "token" in title_low or "jwt" in title_low or "valida" in title_low:
+            search_queries.append("auth OR token OR jwt OR validation")
         if "test" in title_low or "flaky" in title_low or "fail" in title_low:
             search_queries.append("test OR pytest")
         if "depend" in title_low or "http" in title_low or "version" in title_low:
             search_queries.append("requirements.txt OR pyproject.toml")
         if not search_queries:
             search_queries.append("tests")
-        for q in search_queries:
-            res = await self._safe_tool_call(ctx, "search_code", github.search_code, ctx.owner, ctx.repo, q)
-            if res.status == ToolStatus.success and res.data.get("count", 0) > 0:
-                break
+
         file_reads = 0
-        for path in [
-            "demo_project/auth/token.py",
-            "tests/test_auth_token.py",
-            "requirements.txt",
-            "src/auth.py",
-            "README.md",
-        ]:
-            if file_reads >= 3:
-                break
+        search_hits: list[str] = []
+        for query in search_queries:
+            res = await self._safe_tool_call(ctx, "search_code", github.search_code, ctx.owner, ctx.repo, query, per_page=10)
+            if res.status != ToolStatus.success:
+                continue
+            for item in res.data.get("results", []):
+                path = item.get("path")
+                if not path:
+                    continue
+                if path not in search_hits:
+                    search_hits.append(path)
+
+        for path in search_hits[:8]:
             res = await self._safe_tool_call(ctx, "get_file", github.get_file, ctx.owner, ctx.repo, path)
             if res.status == ToolStatus.success and not res.data.get("is_directory"):
                 file_reads += 1
+                # Track this path as verified-existing for the safety guard in _apply_fix.
+                ctx.verified_file_paths.add(path)
+
+        if file_reads < 3:
+            for path in [
+                "demo_project/auth/token.py",
+                "tests/test_auth_token.py",
+                "requirements.txt",
+                "src/auth.py",
+                "README.md",
+            ]:
+                if file_reads >= 3:
+                    break
+                if path in ctx.verified_file_paths:
+                    continue
+                res = await self._safe_tool_call(ctx, "get_file", github.get_file, ctx.owner, ctx.repo, path)
+                if res.status == ToolStatus.success and not res.data.get("is_directory"):
+                    file_reads += 1
+                    ctx.verified_file_paths.add(path)
+        inv_detail = f"Investigated task #{number}; inspected relevant files and search results." if number > 0 else f"Investigated user task '{issue.get('title')}'; inspected relevant files."
         self._jobs.append_step(job, AgentStep(
             name="investigate_selected_task",
             status="completed",
-            detail=f"Investigated task #{number}; inspected relevant files and search results.",
+            detail=inv_detail,
         ))
 
     async def _apply_fix(self, ctx: _AgentContext, github: GitHubToolkit, issue: dict[str, Any]) -> bool:
         job = ctx.job
         owner, repo = ctx.owner, ctx.repo
+
+        if self._is_read_only_goal(ctx.goal):
+            self._jobs.append_step(job, AgentStep(
+                name="read_only_mode",
+                status="completed",
+                detail="Goal is read-only. Skipping branch creation and file modifications.",
+            ))
+            return True
 
         base_sha = DEMO_HEAD_SHA if ctx.demo_mode else (
             await self._resolve_head_sha(github, owner, repo)
@@ -558,9 +640,28 @@ class OpsPilotOrchestrator:
             ctx, "create_branch", github.create_branch, owner, repo, branch_name, base_sha,
         )
         if branch_result.status != ToolStatus.success:
-            self._fail(job, f"Could not create branch: {branch_result.error}", ctx)
-            return False
+            # If the branch already exists (422) try once more with a short
+            # job-scoped suffix so re-running the same goal does not collide
+            # with a branch created by a previous run.  The suffix is the
+            # first 6 hex characters of the job ID — short, deterministic per
+            # job, and valid in a Git ref name.
+            error_msg = branch_result.error or ""
+            if "already exists" in error_msg or "422" in error_msg:
+                suffix = ctx.job.job_id.replace("job_", "")[:6]
+                branch_name = self._unique_branch_name(branch_name, suffix)
+                self._logger.info(
+                    f"Branch collision — retrying with unique name '{branch_name}'",
+                    job_id=ctx.job.job_id,
+                    agent_step="create_branch.retry",
+                )
+                branch_result = await self._safe_tool_call(
+                    ctx, "create_branch", github.create_branch, owner, repo, branch_name, base_sha,
+                )
+            if branch_result.status != ToolStatus.success:
+                self._fail(job, f"Could not create branch: {branch_result.error}", ctx)
+                return False
         ctx.branch_created = True
+        ctx.active_branch_name = branch_name
         self._jobs.append_step(job, AgentStep(
             name="create_branch",
             status="completed",
@@ -568,11 +669,119 @@ class OpsPilotOrchestrator:
         ))
 
         patches = self._resolve_patches(ctx, issue)
+        if not patches:
+            # _resolve_patches found no real verified targets — no modifications to make.
+            self._jobs.append_step(job, AgentStep(
+                name="no_verified_targets",
+                status="needs_attention",
+                detail=(
+                    "No verified repository files found to modify. "
+                    "The agent could not confirm any candidate paths exist in the target repository. "
+                    "Stopping modification workflow safely — no files written."
+                ),
+            ))
+            self._jobs.set_report(
+                job,
+                "Autonomous modification stopped: no files in the target repository could be "
+                "verified as existing. Inspect the repository structure and re-run with a more "
+                "specific goal or provide candidate file paths explicitly.",
+            )
+            self._jobs.transition(
+                job,
+                JobStatus.needs_attention,
+                "No verified file targets — modification skipped.",
+            )
+            return False
+
         for path, new_content, message in patches:
             existing = await self._safe_tool_call(ctx, "get_file", github.get_file, owner, repo, path)
             current_sha = None
             if existing.status == ToolStatus.success and not existing.data.get("is_directory"):
                 current_sha = existing.data.get("sha")
+                # Record this path as verified in case it was not already tracked.
+                ctx.verified_file_paths.add(path)
+
+                # ── Destructive-diff guard ──────────────────────────────────────
+                # Before committing, compare the proposed content against the
+                # original content returned by get_file.  If the replacement would
+                # delete a disproportionate fraction of the original file, the
+                # commit is rejected and the job transitions to needs_attention.
+                #
+                # This caught commit 37fb68f9 where all 214 lines of README.md
+                # were replaced by a single one-line placeholder.
+                original_content: str = existing.data.get("content", "")
+                orig_lines = [l for l in original_content.splitlines() if l.strip()]
+                new_lines  = [l for l in new_content.splitlines() if l.strip()]
+                orig_count = len(orig_lines)
+                new_count  = len(new_lines)
+
+                # Only apply the size check when the original file is non-trivial.
+                _MIN_ORIGINAL_LINES_FOR_CHECK = 5
+                if orig_count >= _MIN_ORIGINAL_LINES_FOR_CHECK:
+                    # How many non-blank lines are preserved?
+                    orig_set = set(orig_lines)
+                    new_set  = set(new_lines)
+                    shared   = orig_set & new_set
+                    retention_ratio = len(shared) / orig_count  # fraction of original kept
+
+                    # Size-ratio: how large is the new file relative to the original?
+                    size_ratio = new_count / orig_count if orig_count else 1.0
+
+                    # Flag as destructive when:
+                    #  • The replacement is dramatically smaller (<= 10% of original size), AND
+                    #  • Almost no original lines are preserved (<= 10% retention).
+                    _SIZE_RATIO_THRESHOLD   = 0.10   # new file is ≤ 10% the size of original
+                    _RETENTION_THRESHOLD    = 0.10   # ≤ 10% of original lines present in new
+
+                    if size_ratio <= _SIZE_RATIO_THRESHOLD and retention_ratio <= _RETENTION_THRESHOLD:
+                        self._jobs.append_step(job, AgentStep(
+                            name="destructive_diff_rejected",
+                            status="needs_attention",
+                            detail=(
+                                f"Proposed modification to '{path}' rejected: it would replace "
+                                f"{orig_count} lines with {new_count} lines "
+                                f"({size_ratio*100:.0f}% of original size, "
+                                f"{retention_ratio*100:.0f}% of original lines preserved). "
+                                "This is classified as an unacceptably large deletion for a "
+                                "'small safe improvement' task. "
+                                "Stopping modification workflow — no files written."
+                            ),
+                        ))
+                        self._fail(
+                            job,
+                            f"Destructive-diff safety guard blocked modification of '{path}': "
+                            f"proposed content ({new_count} lines) would delete "
+                            f"{orig_count - new_count} of {orig_count} original lines "
+                            f"({(1 - retention_ratio) * 100:.0f}% of original content). "
+                            "A 'small safe improvement' must not replace the entire file with "
+                            "a placeholder. Inspect _resolve_patches for the patch-generation bug.",
+                            ctx,
+                        )
+                        return False
+                # ── End destructive-diff guard ──────────────────────────────────
+            else:
+                # Safety guard: a failed get_file (404 or any error) means the file does not
+                # exist in the repository.  We must NOT call modify_file for this path —
+                # doing so would create a new file with placeholder content, which is the
+                # exact production bug (commit 44fd113a, src/main.py).
+                self._jobs.append_step(job, AgentStep(
+                    name="file_verification_failed",
+                    status="needs_attention",
+                    detail=(
+                        f"Cannot modify '{path}': get_file returned "
+                        f"{existing.error or 'not found'!r}. "
+                        "Refusing to create a file that does not exist in the repository. "
+                        "Stopping modification workflow safely."
+                    ),
+                ))
+                self._fail(
+                    job,
+                    f"Autonomous file-modification safety guard: '{path}' does not exist in "
+                    f"{owner}/{repo} (get_file failed: {existing.error or 'not found'}). "
+                    "modify_file rejected to prevent creating placeholder files.",
+                    ctx,
+                )
+                return False
             decision = self._policy.evaluate("modify_file", RiskLevel.medium, True, tool_args={"path": path})
             if decision.needs_approval and not ctx.auto_approve:
                 return self._request_approval_and_halt(
@@ -655,7 +864,15 @@ class OpsPilotOrchestrator:
 
     async def _open_pr(self, ctx: _AgentContext, github: GitHubToolkit, issue: dict[str, Any]) -> bool:
         job = ctx.job
-        branch = self._fix_branch_name(issue)
+        if self._is_read_only_goal(ctx.goal) or not ctx.branch_created:
+            self._jobs.append_step(job, AgentStep(
+                name="create_pr",
+                status="completed",
+                detail="Skipped PR creation (read-only task or no branch created).",
+            ))
+            return True
+
+        branch = self._fix_branch_name(issue) if not ctx.active_branch_name else ctx.active_branch_name
         base = DEMO_HEAD_SHA and "main" if ctx.demo_mode else "main"
         title = self._pr_title(issue)
         body = self._pr_body(ctx, issue, branch)
@@ -697,8 +914,16 @@ class OpsPilotOrchestrator:
         project_id = job.project_id
         number = issue.get("number", 0)
         title = issue.get("title", "")
-        labels = ", ".join(issue.get("labels", []))
-        fix_summary = f"Resolved issue #{number} ('{title}') with changes to token validation (leeway fix) and dependency upgrades."
+        raw_labels = issue.get("labels", [])
+        label_names = [l.get("name", "") if isinstance(l, dict) else str(l) for l in raw_labels]
+        labels = ", ".join(lbl for lbl in label_names if lbl)
+        if self._is_read_only_goal(ctx.goal):
+            fix_summary = f"Completed read-only investigation for task '{title}'. Files inspected, tests checked."
+        elif number > 0:
+            fix_summary = f"Resolved issue #{number} ('{title}') with targeted changes and verified tests."
+        else:
+            fix_summary = f"Resolved user task ('{title}') with targeted changes and verified tests."
+
         mem_fix = self._memory.write(
             project_id,
             MEMORY_TYPE_SUCCESSFUL_FIX,
@@ -712,7 +937,7 @@ class OpsPilotOrchestrator:
         mem_task = self._memory.write(
             project_id,
             MEMORY_TYPE_PREVIOUS_TASK,
-            f"Task: {title} (labels: {labels}). Outcome: fixed, PR created, tests green.",
+            f"Task: {title} (labels: {labels}). Outcome: completed, tests green.",
             source=f"job:{job.job_id}",
             confidence=0.95,
             metadata={"issue_number": number, "priority_score": issue.get("priority_score", 0)},
@@ -750,31 +975,158 @@ class OpsPilotOrchestrator:
         return commits.data["commits"][0].get("sha", "")
 
     @staticmethod
+    def _is_generic_triage_goal(goal: str) -> bool:
+        g = (goal or "").strip().lower()
+        generic_phrases = {
+            "clean up my highest-priority engineering work.",
+            "clean up my highest-priority engineering work",
+            "clean up highest-priority engineering work",
+            "triage repository",
+            "triage open issues",
+            "scan repository",
+            "find issues",
+            "",
+            "string",
+        }
+        return g in generic_phrases
+
+    @staticmethod
+    def _is_read_only_goal(goal: str) -> bool:
+        g = (goal or "").lower()
+
+        # Explicit, direct "do not ..." read-only instructions are stronger than
+        # generic words such as "modify" or "update" that may appear elsewhere.
+        explicit_read_only_phrases = [
+            "do not modify",
+            "dont modify",
+            "don't modify",
+            "do not create a branch",
+            "do not create branch",
+            "do not create commits",
+            "do not create commit",
+            "do not create a pull request",
+            "do not create a pr",
+            "no modification",
+            "no modifications",
+            "read-only",
+            "read only",
+            "inspect only",
+            "audit only",
+            "report only",
+            "dry-run",
+            "dry run",
+        ]
+        if any(phrase in g for phrase in explicit_read_only_phrases):
+            return True
+
+        # Explicit modification instructions take precedence over
+        # descriptive/read-only words elsewhere in the goal.
+        modification_phrases = [
+            "fix",
+            "implement",
+            "modify",
+            "change",
+            "update",
+            "create a branch",
+            "create branch",
+            "add tests",
+            "add or update tests",
+            "update tests",
+            "commit",
+            "pull request",
+            "open a pr",
+            "create a pr",
+        ]
+
+        if any(phrase in g for phrase in modification_phrases):
+            return False
+
+        read_only_phrases = [
+            "read-only",
+            "read only",
+            "do not modify",
+            "dont modify",
+            "don't modify",
+            "no modification",
+            "no modifications",
+            "inspect only",
+            "audit only",
+            "report only",
+            "dry-run",
+            "dry run",
+            "do not create a branch",
+            "do not create branch",
+            "do not create commits",
+            "do not create commit",
+            "do not create a pull request",
+            "do not create a pr",
+        ]
+
+        return any(phrase in g for phrase in read_only_phrases)
+
+    @staticmethod
+    def _extract_task_title(goal: str) -> str:
+        cleaned = (goal or "").strip()
+        if not cleaned:
+            return "User task"
+        first_line = cleaned.split("\n")[0].strip()
+        if len(first_line) > 80:
+            return first_line[:77] + "..."
+        return first_line
+
+    @staticmethod
     def _fix_branch_name(issue: dict[str, Any]) -> str:
         number = issue.get("number", 0)
         title = (issue.get("title") or "fix").lower()
         slug = "".join(c if c.isalnum() else "-" for c in title).strip("-")[:40].strip("-")
-        branch = f"opspilot/fix-issue-{number}-{slug}"
+        if number > 0:
+            branch = f"opspilot/fix-issue-{number}-{slug}"
+        else:
+            branch = f"opspilot/task-{slug}"
         return branch[:63] or DEMO_FIX_BRANCH
+
+    @staticmethod
+    def _unique_branch_name(base: str, suffix: str) -> str:
+        """Return *base* with *suffix* appended, staying within Git ref limits.
+
+        The suffix is separated by a hyphen and the combined name is trimmed to
+        ≤ 63 characters so it remains a valid Git ref name (same constraint as
+        _fix_branch_name).  The suffix must itself be a valid Git ref component
+        (alphanumeric/dashes only).
+
+        Example:
+            base   = "opspilot/task-inspect-the-repository-and-identify-one"
+            suffix = "a3f9c1"
+            result = "opspilot/task-inspect-the-repository-and-iden-a3f9c1"
+        """
+        full = f"{base}-{suffix}"
+        if len(full) <= 63:
+            return full
+        # Trim the base to leave room for "-{suffix}".
+        max_base = 63 - len(suffix) - 1  # 1 for the hyphen
+        trimmed = base[:max_base].rstrip("-")
+        return f"{trimmed}-{suffix}"
 
     @staticmethod
     def _pr_title(issue: dict[str, Any]) -> str:
         number = issue.get("number", 0)
         title = (issue.get("title") or "Fix").capitalize()
-        return f"fix: {title} (#{number})"
+        if number > 0:
+            return f"fix: {title} (#{number})"
+        return f"fix: {title}"
 
     def _pr_body(self, ctx: _AgentContext, issue: dict[str, Any], branch: str) -> str:
-        issue_number = issue.get("number", "?")
+        issue_number = issue.get("number", 0)
         tests_note = "Tests passed after fix." if ctx.tests_passed_after_fix else "Tests not yet verified."
+        closes_line = f"- Closes: #{issue_number}\n" if issue_number > 0 else ""
         return (
             f"## Summary\n"
-            f"Automated fix for issue #{issue_number} generated by OpsPilot.\n\n"
+            f"Automated resolution generated by OpsPilot: {issue.get('title', '')}.\n\n"
             f"- Branch: `{branch}`\n"
-            f"- Closes: #{issue_number}\n"
+            f"{closes_line}"
             f"- {tests_note}\n\n"
-            f"## Changes\n"
-            f"- Applied clock-skew tolerant token validation.\n"
-            f"- Updated httpx, pytest, pydantic, fastapi to stable releases.\n\n"
+            f"## Goal\n"
+            f"{ctx.goal[:300]}\n\n"
             f"_Generated by OpsPilot (job `{ctx.job.job_id}`)._"
         )
 
@@ -794,19 +1146,64 @@ class OpsPilotOrchestrator:
                     f"chore(deps): upgrade httpx and pytest (closes #{issue.get('number', 0)})",
                 ),
             ]
+
+        verified_paths = sorted(ctx.verified_file_paths)
         patches: list[tuple[str, str, str]] = []
-        if any(tok in title_low or tok in body_low for tok in {"auth", "token", "jwt", "flaky", "clock", "skew"}):
-            patches.append((
-                "src/auth/token.py",
-                "# Auth token helpers - leeway-aware fix placeholder (not applied in real repo without Gemini reasoning)\n",
-                f"fix: auth token timing (issue #{issue.get('number', 0)})",
-            ))
-        if any(tok in title_low or tok in body_low for tok in {"httpx", "dependency", "dependabot", "upgrade"}):
-            patches.append((
-                "requirements.txt",
-                "httpx==0.27.2\n",
-                f"chore(deps): upgrade httpx (issue #{issue.get('number', 0)})",
-            ))
+
+        auth_match = any(tok in title_low or tok in body_low for tok in {"auth", "token", "jwt", "flaky", "clock", "skew"})
+        dependency_match = any(tok in title_low or tok in body_low for tok in {"httpx", "dependency", "dependabot", "upgrade"})
+
+        if auth_match:
+            for path in verified_paths:
+                lower = path.lower()
+                if "token" in lower or "auth" in lower:
+                    patches.append((
+                        path,
+                        FIXED_AUTH_TOKEN_PY,
+                        f"fix: auth token timing (issue #{issue.get('number', 0)})",
+                    ))
+                    break
+
+        if dependency_match:
+            for path in verified_paths:
+                lower = path.lower()
+                if "requirements" in lower or lower.endswith("pyproject.toml"):
+                    patches.append((
+                        path,
+                        FIXED_REQUIREMENTS_TXT,
+                        f"chore(deps): upgrade httpx (issue #{issue.get('number', 0)})",
+                    ))
+                    break
+
+        # Fall back to the legacy keyword-targeted guesses only when a real file was
+        # verified to exist in the repo. This keeps the original heuristics but removes
+        # the destructive placeholder path generation that happened when guessed files
+        # were never verified.
+        # Intentionally avoid hard-coded guessed targets in non-demo mode.
+        # The only valid candidates are the repository paths that were actually
+        # discovered and verified via search_code + get_file.  This prevents the
+        # old placeholder-based behavior from resurfacing under a different path.
+
+        # Only keep patches whose target path was verified to exist in the repository.
+        # This prevents modify_file from creating arbitrary new files when a guessed path
+        # does not exist (the src/main.py production bug, commit 44fd113a).
+        verified_patches = [(p, c, m) for (p, c, m) in patches if p in ctx.verified_file_paths]
+        patches = verified_patches
+
+        if not patches:
+            # No keyword-matched AND verified candidates.
+            #
+            # Do NOT fall back to a standalone one-line placeholder comment for an
+            # arbitrary verified file.  That was the cause of commit 37fb68f9, which
+            # replaced all 214 lines of README.md with a single generic comment:
+            #
+            #   "# Autonomous improvement placeholder for goal: ..."
+            #
+            # Instead, return an empty list.  _apply_fix will detect the empty list and
+            # transition the job to needs_attention with a clear report rather than
+            # committing destructive content.
+            pass
+
         return patches
 
     def _select_highest_priority_task(
@@ -834,8 +1231,9 @@ class OpsPilotOrchestrator:
     def _build_plan(self, selected: dict[str, Any], repo: dict[str, Any]) -> list[str]:
         title = selected.get("title", "")
         number = selected.get("number", 0)
+        target_str = f"task #{number}: {title}" if number > 0 else f"user task: {title}"
         return [
-            f"Investigate selected task #{number}: {title}.",
+            f"Investigate selected {target_str}.",
             "Inspect related source files, tests, and repository structure.",
             "Create a dedicated fix branch from the default branch.",
             "Apply targeted source changes using MEDIUM risk modify_file (requires approval if not auto_approve).",
@@ -905,14 +1303,42 @@ class OpsPilotOrchestrator:
             parts.append(f"{a.tool_name} ({a.risk.value}): {a.status.value}")
         return "; ".join(parts)
 
-    def _resolve_github_toolkit(self, ctx: _AgentContext) -> GitHubToolkit:
+    async def _resolve_github_toolkit(self, ctx: _AgentContext) -> GitHubToolkit:
         if self._github is not None:
             return self._github
         if ctx.demo_mode:
             transport = self._demo_transport_override or DemoGitHubTransport(self._settings)
             client = transport.build_client()
             return GitHubToolkit(self._settings, client=client)
-        return GitHubToolkit(self._settings)
+
+        app_service = GitHubAppService(self._settings)
+        inst_id = ctx.installation_id or self._settings.github_app_installation_id
+
+        token = None
+        if inst_id or self._settings.github_app_id:
+            token = await app_service.get_installation_access_token(inst_id)
+
+        # Do not silently fall back to global GITHUB_TOKEN if an authenticated user session exists.
+        # Guard only activates when token exchange returned a non-empty value that equals the
+        # global fallback token — meaning get_installation_access_token fell back to it.
+        # When token is None (exchange failed outright), there is nothing to suppress here;
+        # the subsequent checks will raise the correct authentication error.
+        if (ctx.installation_id or ctx.user_token) and token and token == self._settings.github_token:
+            if ctx.user_token:
+                token = ctx.user_token
+            else:
+                token = None
+
+        if token:
+            return GitHubToolkit(self._settings, token=token)
+
+        if ctx.installation_id or ctx.user_token:
+            raise RuntimeError("GitHub App authentication failed: unable to obtain installation token for authenticated session.")
+
+        if self._settings.github_token:
+            return GitHubToolkit(self._settings, token=self._settings.github_token)
+
+        raise RuntimeError("GitHub authentication required. Please connect GitHub or pass an installation ID.")
 
     async def _safe_tool_call(
         self,
